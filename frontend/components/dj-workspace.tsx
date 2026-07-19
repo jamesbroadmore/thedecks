@@ -253,13 +253,16 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
     [tracks, query]
   )
 
+  const deckVolumes = decks.map((d) => d.volume).join(',')
   useEffect(() => {
     audioRefs.current.forEach((el, i) => {
       if (!el) return
+      const vol = decks[i]?.volume ?? 0.8
       const side = i % 2 === 0 ? Math.min(1, (100 - crossfade) / 50) : Math.min(1, crossfade / 50)
-      el.volume = Math.max(0, Math.min(1, decks[i].volume * side))
+      el.volume = Math.max(0, Math.min(1, vol * side))
     })
-  }, [crossfade, decks])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [crossfade, deckVolumes])
 
   function update(i: number, patch: Partial<Deck>) {
     setDecks((d) => d.map((x, j) => (i === j ? { ...x, ...patch } : x)))
@@ -320,10 +323,9 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
         throw new Error(body?.error || 'Delete failed')
       }
       setDecks((d) =>
-        d.map((x) => {
+        d.map((x, j) => {
           if (x.track?.id !== id) return x
-          const i = d.indexOf(x)
-          const el = audioRefs.current[i]
+          const el = audioRefs.current[j]
           if (el) el.pause()
           return blank()
         })
@@ -640,7 +642,7 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
               }}
             >
               <textarea name="prompt" placeholder="What should I play next?" required aria-label="Ask the assistant" data-testid="assistant-input" />
-              <button className="primary-action" disabled={asking} aria-busy={asking} data-testid="assistant-submit">
+              <button type="submit" className="primary-action" disabled={asking} aria-busy={asking} data-testid="assistant-submit">
                 {asking ? <LoaderCircle className="spin" aria-hidden /> : <Bot aria-hidden />}Ask Gemini
               </button>
             </form>
