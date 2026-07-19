@@ -1,6 +1,6 @@
 'use client'
 
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import useSWR, { type KeyedMutator } from 'swr'
 import {
   FolderOpen,
@@ -13,17 +13,25 @@ import {
 } from 'lucide-react'
 import type { DeviceSource, Track } from '@/lib/types'
 
-const fetcher = (url: string) => fetch(url).then((r) => r.json())
+const fetcher = async (url: string) => {
+  const r = await fetch(url)
+  if (!r.ok) {
+    const body = await r.json().catch(() => null)
+    throw new Error(body?.error || 'Request failed')
+  }
+  return r.json()
+}
 
 async function readDuration(file: File): Promise<number> {
   return new Promise((resolve) => {
     const a = document.createElement('audio')
     const url = URL.createObjectURL(file)
-    a.onloadedmetadata = () => {
-      resolve(Number.isFinite(a.duration) ? a.duration : 0)
+    const done = (n: number) => {
       URL.revokeObjectURL(url)
+      resolve(n)
     }
-    a.onerror = () => resolve(0)
+    a.onloadedmetadata = () => done(Number.isFinite(a.duration) ? a.duration : 0)
+    a.onerror = () => done(0)
     a.src = url
   })
 }
@@ -35,28 +43,43 @@ export function SourcesPanel({
   tracks: Track[]
   mutateTracks: KeyedMutator<Track[]>
 }) {
-  const { data: sources = [], mutate: mutateSources } = useSWR<DeviceSource[]>('/api/device-sources', fetcher)
+  const { data: sources = [], error: sourcesError, mutate: mutateSources } = useSWR<DeviceSource[]>('/api/device-sources', fetcher)
   const filesRef = useRef<HTMLInputElement>(null)
   const folderRef = useRef<HTMLInputElement>(null)
+  const progressTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [importing, setImporting] = useState(false)
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null)
   const [status, setStatus] = useState('')
+  const [statusKind, setStatusKind] = useState<'info' | 'error'>('info')
   const [path, setPath] = useState('')
   const [label, setLabel] = useState('')
   const [type, setType] = useState('local_folder')
   const [addingSource, setAddingSource] = useState(false)
   const [scanning, setScanning] = useState<string | null>(null)
 
+  useEffect(
+    () => () => {
+      if (progressTimer.current) clearTimeout(progressTimer.current)
+    },
+    []
+  )
+
+  function say(message: string, kind: 'info' | 'error' = 'info') {
+    setStatus(message)
+    setStatusKind(kind)
+  }
+
   async function importFiles(fileList: FileList | null) {
     if (!fileList || fileList.length === 0) return
     const files = Array.from(fileList).filter((f) => f.type.startsWith('audio/') || /\.(mp3|wav|flac|m4a|aac|ogg|aiff?)$/i.test(f.name))
     if (files.length === 0) {
-      setStatus('No audio files found in the selection.')
+      say('No audio files found in the selection.', 'error')
       return
     }
     setImporting(true)
     setProgress({ done: 0, total: files.length })
     let ok = 0
+    let failed = 0
     for (let i = 0; i < files.length; i++) {
       const file = files[i]
       try {
@@ -70,20 +93,25 @@ export function SourcesPanel({
         form.set('duration', String(duration))
         const res = await fetch('/api/tracks', { method: 'POST', body: form })
         if (res.ok) ok++
+        else failed++
       } catch {
-        /* skip file */
+        failed++
       }
       setProgress({ done: i + 1, total: files.length })
     }
     await mutateTracks()
     setImporting(false)
-    setStatus(`Imported ${ok} of ${files.length} file${files.length > 1 ? 's' : ''} into your library.`)
-    setTimeout(() => setProgress(null), 1500)
+    say(
+      `Imported ${ok} of ${files.length} file${files.length > 1 ? 's' : ''} into your library.${failed ? ` ${failed} failed.` : ''}`,
+      failed && !ok ? 'error' : 'info'
+    )
+    if (progressTimer.current) clearTimeout(progressTimer.current)
+    progressTimer.current = setTimeout(() => setProgress(null), 1500)
   }
 
   async function addSource(e: React.FormEvent) {
     e.preventDefault()
-    if (!path.trim()) return
+    if (!path.trim() || addingSource) return
     setAddingSource(true)
     try {
       const res = await fetch('/api/device-sources', {
@@ -94,10 +122,14 @@ export function SourcesPanel({
       if (res.ok) {
         setPath('')
         setLabel('')
+        say('Source added. Scan it to import its audio files.')
         await mutateSources()
       } else {
-        setStatus((await res.json()).error || 'Could not add source')
+        const body = await res.json().catch(() => null)
+        say(body?.error || 'Could not add source', 'error')
       }
+    } catch {
+      say('Could not add source. Check your connection and try again.', 'error')
     } finally {
       setAddingSource(false)
     }
@@ -108,14 +140,18 @@ export function SourcesPanel({
     setStatus('')
     try {
       const res = await fetch(`/api/device-sources/${id}/scan`, { method: 'POST' })
-      const json = await res.json()
-      if (res.ok) {
-        setStatus(`Scan complete — imported ${json.scanned} new track${json.scanned === 1 ? '' : 's'}${json.skipped ? `, skipped ${json.skipped} already in library` : ''}.`)
+      const json = await res.json().catch(() => null)
+      if (res.ok && json) {
+        say(
+          `Scan complete — imported ${json.scanned} new track${json.scanned === 1 ? '' : 's'}${json.skipped ? `, skipped ${json.skipped} already in library` : ''}.`
+        )
         await mutateTracks()
         await mutateSources()
       } else {
-        setStatus(json.error || 'Scan failed')
+        say(json?.error || 'Scan failed', 'error')
       }
+    } catch {
+      say('Scan failed. Check your connection and try again.', 'error')
     } finally {
       setScanning(null)
     }
@@ -123,7 +159,15 @@ export function SourcesPanel({
 
   async function removeSource(id: string) {
     if (!confirm('Remove this source? (Tracks already imported stay in your library.)')) return
-    await fetch(`/api/device-sources?id=${id}`, { method: 'DELETE' })
+    try {
+      const res = await fetch(`/api/device-sources?id=${id}`, { method: 'DELETE' })
+      if (!res.ok) {
+        const body = await res.json().catch(() => null)
+        say(body?.error || 'Could not remove the source', 'error')
+      }
+    } catch {
+      say('Could not remove the source.', 'error')
+    }
     await mutateSources()
   }
 
@@ -131,7 +175,7 @@ export function SourcesPanel({
     <div className="feature-panel" data-testid="sources-panel">
       <div className="feature-head">
         <p className="eyebrow">
-          <HardDrive />
+          <HardDrive aria-hidden="true" />
           LOCAL SOURCES
         </p>
         <h1>Bring your own music</h1>
@@ -141,9 +185,9 @@ export function SourcesPanel({
       </div>
 
       <div className="source-grid">
-        <section className="source-card">
+        <section className="source-card" aria-label="Import from this device">
           <header>
-            <Upload />
+            <Upload aria-hidden="true" />
             <div>
               <b>From this device</b>
               <small>Browser import — pick files or a whole folder</small>
@@ -174,18 +218,25 @@ export function SourcesPanel({
             }}
           />
           <div className="source-actions">
-            <button className="primary-action" disabled={importing} onClick={() => filesRef.current?.click()} data-testid="import-files-button">
+            <button type="button" className="primary-action" disabled={importing} onClick={() => filesRef.current?.click()} data-testid="import-files-button">
               {importing ? <LoaderCircle className="spin" /> : <Upload />}
-              Import files
+              {importing ? 'Importing' : 'Import files'}
             </button>
-            <button className="ghost-action" disabled={importing} onClick={() => folderRef.current?.click()} data-testid="import-folder-button">
+            <button type="button" className="ghost-action" disabled={importing} onClick={() => folderRef.current?.click()} data-testid="import-folder-button">
               <FolderOpen />
               Import folder
             </button>
           </div>
           {progress && (
             <div className="progress-line" data-testid="import-progress">
-              <div className="progress-bar">
+              <div
+                className="progress-bar"
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={progress.total}
+                aria-valuenow={progress.done}
+                aria-label="Import progress"
+              >
                 <span style={{ width: `${(progress.done / progress.total) * 100}%` }} />
               </div>
               <small>
@@ -195,23 +246,30 @@ export function SourcesPanel({
           )}
         </section>
 
-        <section className="source-card">
+        <section className="source-card" aria-label="Server folders">
           <header>
-            <HardDrive />
+            <HardDrive aria-hidden="true" />
             <div>
               <b>Server folders</b>
               <small>Scan a directory on the host (local / SMB / NFS mount)</small>
             </div>
           </header>
           <form className="source-form" onSubmit={addSource}>
-            <select value={type} onChange={(e) => setType(e.target.value)} data-testid="source-type-select">
+            <select value={type} onChange={(e) => setType(e.target.value)} aria-label="Source type" data-testid="source-type-select">
               <option value="local_folder">Local folder</option>
               <option value="smb_share">SMB share</option>
               <option value="nfs_share">NFS share</option>
             </select>
-            <input value={path} onChange={(e) => setPath(e.target.value)} placeholder="/app/sample-music" data-testid="source-path-input" />
-            <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="Label (optional)" data-testid="source-label-input" />
-            <button className="primary-action" disabled={addingSource} data-testid="add-source-button">
+            <input
+              value={path}
+              onChange={(e) => setPath(e.target.value)}
+              placeholder="/app/sample-music"
+              aria-label="Folder path"
+              required
+              data-testid="source-path-input"
+            />
+            <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="Label (optional)" aria-label="Source label" data-testid="source-label-input" />
+            <button className="primary-action" disabled={addingSource || !path.trim()} data-testid="add-source-button">
               {addingSource ? <LoaderCircle className="spin" /> : <Plus />}
               Add source
             </button>
@@ -221,14 +279,16 @@ export function SourcesPanel({
       </div>
 
       {status && (
-        <p className="status-line" data-testid="sources-status">
+        <p className={`status-line ${statusKind === 'error' ? 'error' : ''}`} role="status" data-testid="sources-status">
           {status}
         </p>
       )}
 
-      <section className="sources-list">
+      <section className="sources-list" aria-label="Registered sources">
         <h2>Registered sources</h2>
-        {sources.length === 0 ? (
+        {sourcesError ? (
+          <p className="status-line error">Could not load sources: {sourcesError.message}</p>
+        ) : sources.length === 0 ? (
           <p className="muted">No server folders yet. Add one above to scan it for audio.</p>
         ) : (
           <div className="sources-rows" data-testid="sources-list">
@@ -242,11 +302,17 @@ export function SourcesPanel({
                   <small className="muted">{s.lastScanned ? `Last scanned ${new Date(s.lastScanned).toLocaleString()}` : 'Never scanned'}</small>
                 </div>
                 <div className="source-row-actions">
-                  <button className="ghost-action" disabled={scanning === s.id} onClick={() => scan(s.id)} data-testid={`scan-source-${s.id}`}>
+                  <button type="button" className="ghost-action" disabled={scanning === s.id} onClick={() => scan(s.id)} data-testid={`scan-source-${s.id}`}>
                     {scanning === s.id ? <LoaderCircle className="spin" /> : <RefreshCw />}
-                    Scan
+                    {scanning === s.id ? 'Scanning' : 'Scan'}
                   </button>
-                  <button className="icon-button danger" onClick={() => removeSource(s.id)} aria-label="Remove source" data-testid={`remove-source-${s.id}`}>
+                  <button
+                    type="button"
+                    className="icon-button danger"
+                    onClick={() => removeSource(s.id)}
+                    aria-label={`Remove source ${s.label}`}
+                    data-testid={`remove-source-${s.id}`}
+                  >
                     <Trash2 />
                   </button>
                 </div>

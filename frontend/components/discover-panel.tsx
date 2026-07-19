@@ -29,17 +29,21 @@ export function DiscoverPanel({ mutateTracks }: { mutateTracks: KeyedMutator<Tra
 
   async function search(e?: React.FormEvent) {
     e?.preventDefault()
-    if (!query.trim()) return
+    if (!query.trim() || loading) return
+    const active = (Object.keys(sources) as CatalogSource[]).filter((s) => sources[s])
+    if (active.length === 0) {
+      setError('Enable at least one catalog source to search.')
+      return
+    }
     setLoading(true)
     setError('')
     setSearched(true)
     try {
-      const active = (Object.keys(sources) as CatalogSource[]).filter((s) => sources[s])
       const res = await fetch(`/api/catalog?q=${encodeURIComponent(query.trim())}&sources=${active.join(',')}`)
-      const json = await res.json()
-      if (!res.ok) throw new Error(json.error || 'Search failed')
-      setResults(json.results || [])
-      setNotes(json.notes || [])
+      const json = await res.json().catch(() => null)
+      if (!res.ok) throw new Error(json?.error || 'Search failed')
+      setResults(json?.results || [])
+      setNotes(json?.notes || [])
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Search failed')
       setResults([])
@@ -49,7 +53,9 @@ export function DiscoverPanel({ mutateTracks }: { mutateTracks: KeyedMutator<Tra
   }
 
   async function importItem(item: CatalogItem) {
+    if (importing) return
     setImporting(item.id)
+    setError('')
     try {
       const res = await fetch('/api/catalog/import', {
         method: 'POST',
