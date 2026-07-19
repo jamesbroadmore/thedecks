@@ -24,5 +24,6 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
     pathname: track.blobPathname,
     localPath: track.localPath,
     contentType: track.contentType || 'audio/mpeg',
+    disposition: `inline; filename="${encodeURIComponent(track.fileName)}"`,
   })
 }

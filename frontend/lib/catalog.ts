@@ -96,7 +96,7 @@ export async function searchCcMixter(q: string, limit = 12): Promise<CatalogItem
         const pick = files.find((f) => /\.mp3$/i.test(f.download_url)) || files[0]
         const dl: string | undefined = pick?.download_url
         if (!dl) return null
-        const https = dl.startsWith('https')
+        const isHttps = dl.startsWith('https')
         return {
           id: `cc:${u.upload_id}`,
           source: 'ccmixter' as const,
@@ -104,7 +104,7 @@ export async function searchCcMixter(q: string, limit = 12): Promise<CatalogItem
           artist: u.user_real_name || u.user_name || 'ccMixter artist',
           license: u.license_name || 'Creative Commons',
           downloadUrl: dl,
-          previewUrl: https ? dl : null,
+          previewUrl: isHttps ? dl : null,
           pageUrl: u.file_page_url || u.artist_page_url || null,
           cover: null,
           duration: null,

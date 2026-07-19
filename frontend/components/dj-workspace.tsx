@@ -126,8 +126,10 @@ function DeckView({
         onEnded={() => onDeck({ playing: false })}
         onLoadedMetadata={(e) => {
           const el = e.currentTarget
-          el.playbackRate = deck.rate
-          onDeck({ duration: el.duration || 0 })
+          // Always reset to 1× on new load; the user can re-adjust via the slider.
+          // Keeping the stale `deck.rate` here causes wrong speed after track-swapping.
+          el.playbackRate = 1
+          onDeck({ duration: el.duration || 0, rate: 1 })
         }}
         onTimeUpdate={(e) => {
           const el = e.currentTarget
@@ -243,6 +245,7 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
   const [crossfade, setCrossfade] = useState(50)
   const [uploading, setUploading] = useState(false)
   const [libraryStatus, setLibraryStatus] = useState('')
+  const [libraryStatusError, setLibraryStatusError] = useState(false)
   const [assistant, setAssistant] = useState('Ask for a transition, set-building, or harmonic-mixing recommendation.')
   const [asking, setAsking] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
@@ -264,6 +267,11 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [crossfade, deckVolumes])
 
+  // Clamp the visible mobile deck whenever the deck count decreases
+  useEffect(() => {
+    setMobileDeck((m) => Math.min(m, deckCount - 1))
+  }, [deckCount])
+
   function update(i: number, patch: Partial<Deck>) {
     setDecks((d) => d.map((x, j) => (i === j ? { ...x, ...patch } : x)))
   }
@@ -276,10 +284,14 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
     }
     setDecks((d) => d.map((x, j) => (i === j ? { ...blank(), track: t } : x)))
   }
+  function showStatus(msg: string, isError = false) {
+    setLibraryStatus(msg)
+    setLibraryStatusError(isError)
+  }
 
   async function upload(file: File) {
     setUploading(true)
-    setLibraryStatus('')
+    showStatus('')
     try {
       const duration = await new Promise<number>((resolve) => {
         const a = document.createElement('audio')
@@ -305,9 +317,9 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
         throw new Error(body?.error || 'Upload failed')
       }
       await mutate()
-      setLibraryStatus(`Added “${parts.length > 1 ? parts.slice(1).join(' - ') : base}” to your library.`)
+      showStatus(`Added "${parts.length > 1 ? parts.slice(1).join(' - ') : base}" to your library.`)
     } catch (e) {
-      setLibraryStatus(e instanceof Error ? e.message : 'Upload failed')
+      showStatus(e instanceof Error ? e.message : 'Upload failed', true)
     } finally {
       setUploading(false)
     }
@@ -315,7 +327,7 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
 
   async function remove(id: string) {
     if (!confirm('Delete this track from your private library?')) return
-    setLibraryStatus('')
+    showStatus('')
     try {
       const res = await fetch(`/api/tracks?id=${id}`, { method: 'DELETE' })
       if (!res.ok) {
@@ -331,8 +343,9 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
         })
       )
       await mutate()
+      showStatus('Track removed from your library.')
     } catch (e) {
-      setLibraryStatus(e instanceof Error ? e.message : 'Delete failed')
+      showStatus(e instanceof Error ? e.message : 'Delete failed', true)
     }
   }
 
@@ -543,7 +556,7 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
               </button>
             </header>
             {libraryStatus && (
-              <p className={`status-line library-status ${libraryStatus.includes('failed') || libraryStatus.includes('error') || libraryStatus.includes('Delete') || libraryStatus.includes('unavailable') ? 'error' : ''}`} role="status" data-testid="library-status">
+              <p className={`status-line library-status ${libraryStatusError ? 'error' : ''}`} role="status" data-testid="library-status">
                 {libraryStatus}
               </p>
             )}
@@ -577,12 +590,19 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
                 {filtered.map((t, i) => (
                   <article key={t.id} data-testid={`track-row-${t.id}`}>
                     <span>{String(i + 1).padStart(2, '0')}</span>
-                    <div>
-                      <b>{t.title}</b>
-                      <small>
-                        {t.artist} · {time(t.duration || 0)}
-                        {t.metadata?.source && t.metadata.source !== 'upload' ? ` · ${String(t.metadata.source).replace('_', ' ')}` : ''}
-                      </small>
+                    <div className="track-art-info">
+                      {t.coverArt ? (
+                        <Image src={t.coverArt} width={36} height={36} alt="" className="track-thumb" unoptimized />
+                      ) : (
+                        <span className="track-thumb-placeholder" aria-hidden="true"><Disc3 /></span>
+                      )}
+                      <div>
+                        <b>{t.title}</b>
+                        <small>
+                          {t.artist} · {time(t.duration || 0)}
+                          {t.metadata?.source && t.metadata.source !== 'upload' ? ` · ${String(t.metadata.source).replace('_', ' ')}` : ''}
+                        </small>
+                      </div>
                     </div>
                     <span>{t.bpm?.toFixed(1) || '—'} BPM</span>
                     <span>{t.musicalKey || '—'}</span>

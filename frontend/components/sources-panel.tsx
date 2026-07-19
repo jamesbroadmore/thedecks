@@ -164,11 +164,12 @@ export function SourcesPanel({
       if (!res.ok) {
         const body = await res.json().catch(() => null)
         say(body?.error || 'Could not remove the source', 'error')
+      } else {
+        await mutateSources()
       }
     } catch {
       say('Could not remove the source.', 'error')
     }
-    await mutateSources()
   }
 
   return (

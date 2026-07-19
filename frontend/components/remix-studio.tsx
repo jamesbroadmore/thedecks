@@ -64,6 +64,7 @@ export function RemixStudio({ tracks }: { tracks: Track[] }) {
   // Read at save time so the latest title/elapsed are used when the recorder stops.
   const mixTitleRef = useRef(mixTitle)
   const elapsedRef = useRef(elapsed)
+  const mimeTypeRef = useRef('')
   mixTitleRef.current = mixTitle
   elapsedRef.current = elapsed
 
@@ -157,9 +158,17 @@ export function RemixStudio({ tracks }: { tracks: Track[] }) {
       return
     }
     chunksRef.current = []
+    // Pick a MIME type the current browser supports (Safari prefers audio/mp4)
+    const preferredMime = [
+      'audio/webm;codecs=opus',
+      'audio/webm',
+      'audio/ogg;codecs=opus',
+      'audio/mp4',
+    ].find((t) => MediaRecorder.isTypeSupported(t)) || ''
+    mimeTypeRef.current = preferredMime
     let mr: MediaRecorder
     try {
-      mr = new MediaRecorder(destRef.current.stream)
+      mr = new MediaRecorder(destRef.current.stream, preferredMime ? { mimeType: preferredMime } : {})
     } catch {
       say('Recording is not supported in this browser.', 'error')
       return
@@ -190,7 +199,8 @@ export function RemixStudio({ tracks }: { tracks: Track[] }) {
   async function saveRecording() {
     setSaving(true)
     try {
-      const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
+      const mimeType = mimeTypeRef.current || 'audio/webm'
+      const blob = new Blob(chunksRef.current, { type: mimeType })
       chunksRef.current = []
       if (blob.size === 0) {
         say('Nothing was recorded — start playback before recording.', 'error')
@@ -248,6 +258,12 @@ export function RemixStudio({ tracks }: { tracks: Track[] }) {
             value={id}
             aria-label={`Deck ${side.toUpperCase()} track`}
             onChange={(e) => {
+              // Pause and rewind the current element before switching tracks
+              const current = el.current
+              if (current) {
+                current.pause()
+                current.currentTime = 0
+              }
               setId(e.target.value)
               setLoop(noLoop())
               setPlaying((p) => ({ ...p, [side]: false }))
