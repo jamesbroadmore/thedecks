@@ -16,14 +16,21 @@ import {
 } from 'lucide-react'
 import type { Recording, Track } from '@/lib/types'
 
-const fetcher = (url: string) => fetch(url).then((r) => r.json())
+const fetcher = async (url: string) => {
+  const r = await fetch(url)
+  if (!r.ok) {
+    const body = await r.json().catch(() => null)
+    throw new Error(body?.error || 'Request failed')
+  }
+  return r.json()
+}
 const fmt = (n: number) => `${Math.floor((n || 0) / 60)}:${String(Math.floor((n || 0) % 60)).padStart(2, '0')}`
 
 type Loop = { on: boolean; start: number; end: number }
 const noLoop = (): Loop => ({ on: false, start: 0, end: 0 })
 
 export function RemixStudio({ tracks }: { tracks: Track[] }) {
-  const { data: recordings = [], mutate: mutateRecs } = useSWR<Recording[]>('/api/recordings', fetcher)
+  const { data: recordings = [], error: recError, mutate: mutateRecs } = useSWR<Recording[]>('/api/recordings', fetcher)
 
   const [aId, setAId] = useState('')
   const [bId, setBId] = useState('')
@@ -37,6 +44,7 @@ export function RemixStudio({ tracks }: { tracks: Track[] }) {
   const [saving, setSaving] = useState(false)
   const [mixTitle, setMixTitle] = useState('')
   const [status, setStatus] = useState('Pick two tracks, blend them with the crossfader and filter, then record to export your mashup.')
+  const [statusKind, setStatusKind] = useState<'info' | 'error'>('info')
 
   const aEl = useRef<HTMLAudioElement | null>(null)
   const bEl = useRef<HTMLAudioElement | null>(null)
@@ -47,11 +55,26 @@ export function RemixStudio({ tracks }: { tracks: Track[] }) {
   const destRef = useRef<MediaStreamAudioDestinationNode | null>(null)
   const recorderRef = useRef<MediaRecorder | null>(null)
   const chunksRef = useRef<Blob[]>([])
-  const timerRef = useRef<any>(null)
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  // Loops are read inside audio timeupdate callbacks; refs avoid stale-closure loop points.
+  const loopARef = useRef(loopA)
+  const loopBRef = useRef(loopB)
+  loopARef.current = loopA
+  loopBRef.current = loopB
+  // Read at save time so the latest title/elapsed are used when the recorder stops.
+  const mixTitleRef = useRef(mixTitle)
+  const elapsedRef = useRef(elapsed)
+  mixTitleRef.current = mixTitle
+  elapsedRef.current = elapsed
+
+  function say(message: string, kind: 'info' | 'error' = 'info') {
+    setStatus(message)
+    setStatusKind(kind)
+  }
 
   function ensureGraph() {
     if (ctxRef.current || !aEl.current || !bEl.current) return
-    const Ctx = window.AudioContext || (window as any).webkitAudioContext
+    const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
     const ctx: AudioContext = new Ctx()
     const srcA = ctx.createMediaElementSource(aEl.current)
     const srcB = ctx.createMediaElementSource(bEl.current)
@@ -87,12 +110,25 @@ export function RemixStudio({ tracks }: { tracks: Track[] }) {
   useEffect(() => {
     if (filterRef.current) filterRef.current.frequency.value = cutoff
   }, [cutoff])
-  useEffect(() => () => clearInterval(timerRef.current), [])
+  // Tear down the timer, recorder, and audio graph when leaving the studio.
+  useEffect(
+    () => () => {
+      if (timerRef.current) clearInterval(timerRef.current)
+      const mr = recorderRef.current
+      if (mr && mr.state !== 'inactive') {
+        mr.onstop = null
+        mr.stop()
+      }
+      ctxRef.current?.close().catch(() => {})
+      ctxRef.current = null
+    },
+    []
+  )
 
   async function toggle(which: 'a' | 'b') {
     ensureGraph()
     const ctx = ctxRef.current
-    if (ctx && ctx.state === 'suspended') await ctx.resume()
+    if (ctx && ctx.state === 'suspended') await ctx.resume().catch(() => {})
     const el = which === 'a' ? aEl.current : bEl.current
     if (!el || !el.src) return
     if (el.paused) {
@@ -108,32 +144,46 @@ export function RemixStudio({ tracks }: { tracks: Track[] }) {
 
   function handleTime(which: 'a' | 'b') {
     const el = which === 'a' ? aEl.current : bEl.current
-    const loop = which === 'a' ? loopA : loopB
+    const loop = which === 'a' ? loopARef.current : loopBRef.current
     if (el && loop.on && loop.end > loop.start && el.currentTime >= loop.end) el.currentTime = loop.start
   }
 
   function startRecording() {
     ensureGraph()
     const ctx = ctxRef.current
-    if (ctx && ctx.state === 'suspended') ctx.resume()
-    if (!destRef.current) return
+    if (ctx && ctx.state === 'suspended') ctx.resume().catch(() => {})
+    if (!destRef.current) {
+      say('Load and play a track first so there is audio to record.', 'error')
+      return
+    }
     chunksRef.current = []
-    const mr = new MediaRecorder(destRef.current.stream)
+    let mr: MediaRecorder
+    try {
+      mr = new MediaRecorder(destRef.current.stream)
+    } catch {
+      say('Recording is not supported in this browser.', 'error')
+      return
+    }
     mr.ondataavailable = (e) => {
       if (e.data.size > 0) chunksRef.current.push(e.data)
     }
-    mr.onstop = () => saveRecording()
     mr.start()
     recorderRef.current = mr
     setRecording(true)
     setElapsed(0)
-    setStatus('Recording the master output… play, blend and filter live.')
+    say('Recording the master output… play, blend and filter live.')
     timerRef.current = setInterval(() => setElapsed((e) => e + 1), 1000)
   }
 
   function stopRecording() {
-    recorderRef.current?.stop()
-    clearInterval(timerRef.current)
+    const mr = recorderRef.current
+    if (mr && mr.state !== 'inactive') {
+      // Attach onstop here so it closes over current state, not the state at record start.
+      mr.onstop = () => saveRecording()
+      mr.stop()
+    }
+    if (timerRef.current) clearInterval(timerRef.current)
+    timerRef.current = null
     setRecording(false)
   }
 
@@ -141,22 +191,26 @@ export function RemixStudio({ tracks }: { tracks: Track[] }) {
     setSaving(true)
     try {
       const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
+      chunksRef.current = []
       if (blob.size === 0) {
-        setStatus('Nothing was recorded — start playback before recording.')
+        say('Nothing was recorded — start playback before recording.', 'error')
         return
       }
       const form = new FormData()
       form.set('file', blob, 'mix.webm')
-      form.set('title', mixTitle.trim() || `Mashup ${new Date().toLocaleString()}`)
-      form.set('duration', String(elapsed))
+      form.set('title', mixTitleRef.current.trim() || `Mashup ${new Date().toLocaleString()}`)
+      form.set('duration', String(elapsedRef.current))
       const res = await fetch('/api/recordings', { method: 'POST', body: form })
       if (res.ok) {
         setMixTitle('')
-        setStatus('Mix exported and saved to your Recordings library.')
+        say('Mix exported and saved to your Recordings library.')
         await mutateRecs()
       } else {
-        setStatus((await res.json()).error || 'Could not save the recording.')
+        const body = await res.json().catch(() => null)
+        say(body?.error || 'Could not save the recording.', 'error')
       }
+    } catch {
+      say('Could not save the recording. Check your connection and try again.', 'error')
     } finally {
       setSaving(false)
     }
@@ -164,11 +218,22 @@ export function RemixStudio({ tracks }: { tracks: Track[] }) {
 
   async function deleteRecording(id: string) {
     if (!confirm('Delete this recording?')) return
-    await fetch(`/api/recordings?id=${id}`, { method: 'DELETE' })
+    try {
+      const res = await fetch(`/api/recordings?id=${id}`, { method: 'DELETE' })
+      if (!res.ok) {
+        const body = await res.json().catch(() => null)
+        say(body?.error || 'Could not delete the recording.', 'error')
+      }
+    } catch {
+      say('Could not delete the recording.', 'error')
+    }
     await mutateRecs()
   }
 
-  function DeckPicker({ side }: { side: 'a' | 'b' }) {
+  // Rendered as a plain function (not a nested component) so the <audio> elements
+  // stay mounted across re-renders — a nested component type would remount them
+  // on every crossfade/filter change and cut playback.
+  function renderDeck(side: 'a' | 'b') {
     const id = side === 'a' ? aId : bId
     const setId = side === 'a' ? setAId : setBId
     const el = side === 'a' ? aEl : bEl
@@ -176,11 +241,12 @@ export function RemixStudio({ tracks }: { tracks: Track[] }) {
     const setLoop = side === 'a' ? setLoopA : setLoopB
     const track = tracks.find((t) => t.id === id)
     return (
-      <section className="remix-deck" data-testid={`remix-deck-${side}`}>
+      <section className="remix-deck" data-testid={`remix-deck-${side}`} aria-label={`Remix deck ${side.toUpperCase()}`}>
         <header>
-          <b className="deck-letter">{side.toUpperCase()}</b>
+          <b className="deck-letter" aria-hidden="true">{side.toUpperCase()}</b>
           <select
             value={id}
+            aria-label={`Deck ${side.toUpperCase()} track`}
             onChange={(e) => {
               setId(e.target.value)
               setLoop(noLoop())
@@ -202,32 +268,47 @@ export function RemixStudio({ tracks }: { tracks: Track[] }) {
           preload="metadata"
           onPlay={() => setPlaying((p) => ({ ...p, [side]: true }))}
           onPause={() => setPlaying((p) => ({ ...p, [side]: false }))}
+          onEnded={() => setPlaying((p) => ({ ...p, [side]: false }))}
           onTimeUpdate={() => handleTime(side)}
         />
         <p className="remix-nowplaying">{track ? `${track.bpm?.toFixed(1) || '—'} BPM · ${track.musicalKey || 'KEY —'}` : 'No track loaded'}</p>
         <div className="remix-transport">
-          <button className="transport play" disabled={!id} onClick={() => toggle(side)} data-testid={`remix-play-${side}`}>
+          <button
+            type="button"
+            className="transport play"
+            disabled={!id}
+            onClick={() => toggle(side)}
+            aria-label={playing[side] ? `Pause deck ${side.toUpperCase()}` : `Play deck ${side.toUpperCase()}`}
+            data-testid={`remix-play-${side}`}
+          >
             {playing[side] ? <Pause /> : <Play />}
           </button>
           <button
+            type="button"
             className="transport"
             disabled={!id}
             onClick={() => setLoop((l) => ({ ...l, start: el.current?.currentTime || 0 }))}
+            aria-label={`Set loop in point on deck ${side.toUpperCase()}`}
             data-testid={`remix-cuein-${side}`}
           >
             IN {loop.start ? fmt(loop.start) : ''}
           </button>
           <button
+            type="button"
             className="transport"
             disabled={!id}
             onClick={() => setLoop((l) => ({ ...l, end: el.current?.currentTime || 0 }))}
+            aria-label={`Set loop out point on deck ${side.toUpperCase()}`}
             data-testid={`remix-cueout-${side}`}
           >
             OUT {loop.end ? fmt(loop.end) : ''}
           </button>
           <button
+            type="button"
             className={`transport ${loop.on ? 'active' : ''}`}
             disabled={!id || loop.end <= loop.start}
+            aria-pressed={loop.on}
+            aria-label={`Toggle loop on deck ${side.toUpperCase()}`}
             onClick={() => setLoop((l) => ({ ...l, on: !l.on }))}
             data-testid={`remix-loop-${side}`}
           >
@@ -242,7 +323,7 @@ export function RemixStudio({ tracks }: { tracks: Track[] }) {
     <div className="feature-panel" data-testid="remix-panel">
       <div className="feature-head">
         <p className="eyebrow">
-          <Scissors />
+          <Scissors aria-hidden="true" />
           REMIX STUDIO
         </p>
         <h1>Mashup &amp; record</h1>
@@ -252,14 +333,22 @@ export function RemixStudio({ tracks }: { tracks: Track[] }) {
       </div>
 
       <div className="remix-decks">
-        <DeckPicker side="a" />
-        <DeckPicker side="b" />
+        {renderDeck('a')}
+        {renderDeck('b')}
       </div>
 
-      <section className="remix-mixer">
+      <section className="remix-mixer" aria-label="Remix mixer">
         <label>
           CROSSFADER A ↔ B
-          <input type="range" min="0" max="100" value={crossfade} onChange={(e) => setCrossfade(Number(e.target.value))} data-testid="remix-crossfader" />
+          <input
+            type="range"
+            min="0"
+            max="100"
+            value={crossfade}
+            aria-label="Remix crossfader"
+            onChange={(e) => setCrossfade(Number(e.target.value))}
+            data-testid="remix-crossfader"
+          />
         </label>
         <label>
           LOW-PASS FILTER {cutoff >= 20000 ? 'OFF' : `${(cutoff / 1000).toFixed(1)}kHz`}
@@ -269,42 +358,46 @@ export function RemixStudio({ tracks }: { tracks: Track[] }) {
             max="20000"
             step="100"
             value={cutoff}
+            aria-label="Low-pass filter cutoff"
             onChange={(e) => setCutoff(Number(e.target.value))}
             data-testid="remix-filter"
           />
         </label>
       </section>
 
-      <section className="remix-record">
+      <section className="remix-record" aria-label="Record mix">
         <input
           value={mixTitle}
           onChange={(e) => setMixTitle(e.target.value)}
           placeholder="Name your mix"
+          aria-label="Mix title"
           className="mix-title-input"
           data-testid="remix-title-input"
         />
         {recording ? (
-          <button className="record-btn on" onClick={stopRecording} data-testid="remix-stop-button">
+          <button type="button" className="record-btn on" onClick={stopRecording} data-testid="remix-stop-button">
             <Square />
             Stop · {fmt(elapsed)}
           </button>
         ) : (
-          <button className="record-btn" onClick={startRecording} disabled={saving} data-testid="remix-record-button">
+          <button type="button" className="record-btn" onClick={startRecording} disabled={saving} data-testid="remix-record-button">
             {saving ? <LoaderCircle className="spin" /> : <Circle />}
             {saving ? 'Saving…' : 'Record mix'}
           </button>
         )}
       </section>
 
-      <p className="status-line" data-testid="remix-status">
+      <p className={`status-line ${statusKind === 'error' ? 'error' : ''}`} role="status" data-testid="remix-status">
         {status}
       </p>
 
-      <section className="recordings-list">
+      <section className="recordings-list" aria-label="Recordings">
         <h2>
-          <Disc3 /> Recordings ({recordings.length})
+          <Disc3 aria-hidden="true" /> Recordings ({recordings.length})
         </h2>
-        {recordings.length === 0 ? (
+        {recError ? (
+          <p className="status-line error">Could not load recordings: {recError.message}</p>
+        ) : recordings.length === 0 ? (
           <p className="muted">No mixes yet — record your first mashup above.</p>
         ) : (
           <div className="recordings-rows" data-testid="recordings-list">
@@ -318,10 +411,22 @@ export function RemixStudio({ tracks }: { tracks: Track[] }) {
                 </div>
                 <audio controls preload="none" src={`/api/recordings/${r.id}/stream`} className="rec-audio" data-testid={`recording-audio-${r.id}`} />
                 <div className="rec-actions">
-                  <a className="icon-button" href={`/api/recordings/${r.id}/stream`} download data-testid={`download-recording-${r.id}`} aria-label="Download">
+                  <a
+                    className="icon-button"
+                    href={`/api/recordings/${r.id}/stream`}
+                    download
+                    data-testid={`download-recording-${r.id}`}
+                    aria-label={`Download ${r.title}`}
+                  >
                     <Download />
                   </a>
-                  <button className="icon-button danger" onClick={() => deleteRecording(r.id)} aria-label="Delete recording" data-testid={`delete-recording-${r.id}`}>
+                  <button
+                    type="button"
+                    className="icon-button danger"
+                    onClick={() => deleteRecording(r.id)}
+                    aria-label={`Delete ${r.title}`}
+                    data-testid={`delete-recording-${r.id}`}
+                  >
                     <Trash2 />
                   </button>
                 </div>

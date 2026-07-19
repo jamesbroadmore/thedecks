@@ -2,7 +2,7 @@
 
 import Image from 'next/image'
 import useSWR from 'swr'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type ComponentType } from 'react'
 import {
   Bot,
   Compass,
@@ -41,11 +41,14 @@ type Deck = {
 
 type View = 'perform' | 'sources' | 'discover' | 'remix'
 
-const fetcher = (url: string) =>
-  fetch(url).then(async (r) => {
-    if (!r.ok) throw new Error((await r.json()).error || 'Request failed')
-    return r.json()
-  })
+const fetcher = async (url: string) => {
+  const r = await fetch(url)
+  if (!r.ok) {
+    const body = await r.json().catch(() => null)
+    throw new Error(body?.error || 'Request failed')
+  }
+  return r.json()
+}
 
 const blank = (): Deck => ({
   track: null,
@@ -64,7 +67,7 @@ const time = (n: number) =>
 function Wave({ progress }: { progress: number }) {
   const bars = [28, 46, 64, 35, 72, 51, 82, 42, 69, 31, 57, 76, 43, 66, 38, 85, 53, 71, 47, 62, 33, 79, 55, 68, 41, 74, 49, 88, 37, 64, 52, 77, 45, 69, 34, 81, 58, 72, 40, 61]
   return (
-    <div className="waveform" aria-label="Playback progress">
+    <div className="waveform" role="img" aria-label={`Playback progress ${Math.round(progress * 100)}%`}>
       {bars.map((h, i) => (
         <i key={i} style={{ height: `${h}%`, background: i / bars.length < progress ? 'var(--primary)' : undefined }} />
       ))}
@@ -84,36 +87,57 @@ function DeckView({
   index: number
   deck: Deck
   audio: (el: HTMLAudioElement | null) => void
-  onDeck: (d: Deck) => void
+  onDeck: (patch: Partial<Deck>) => void
   onLoad: (t: Track) => void
   tracks: Track[]
 }) {
   const letter = String.fromCharCode(65 + index)
+  const elRef = useRef<HTMLAudioElement | null>(null)
+  const loopRef = useRef<{ start: number | null; end: number | null }>({ start: deck.loopStart, end: deck.loopEnd })
+  loopRef.current = { start: deck.loopStart, end: deck.loopEnd }
+  const looping = deck.loopStart !== null && deck.loopEnd !== null
+
   async function toggle() {
-    if (!deck.track) return
-    const el = document.querySelector<HTMLAudioElement>(`#deck-audio-${index}`)
-    if (!el) return
-    if (el.paused) await el.play()
-    else el.pause()
+    const el = elRef.current
+    if (!el || !deck.track) return
+    if (el.paused) {
+      try {
+        await el.play()
+      } catch {
+        /* play() can be interrupted by a new load — the pause event keeps state coherent */
+      }
+    } else {
+      el.pause()
+    }
   }
+
   return (
     <section className="panel deck-panel" aria-label={`Deck ${letter}`} data-testid={`deck-${letter.toLowerCase()}`}>
       <audio
         id={`deck-audio-${index}`}
-        ref={audio}
+        ref={(el) => {
+          elRef.current = el
+          audio(el)
+        }}
         src={deck.track ? `/api/tracks/${deck.track.id}/stream` : undefined}
         preload="metadata"
-        onPlay={() => onDeck({ ...deck, playing: true })}
-        onPause={() => onDeck({ ...deck, playing: false })}
-        onLoadedMetadata={(e) => onDeck({ ...deck, duration: e.currentTarget.duration || 0 })}
+        onPlay={() => onDeck({ playing: true })}
+        onPause={() => onDeck({ playing: false })}
+        onEnded={() => onDeck({ playing: false })}
+        onLoadedMetadata={(e) => {
+          const el = e.currentTarget
+          el.playbackRate = deck.rate
+          onDeck({ duration: el.duration || 0 })
+        }}
         onTimeUpdate={(e) => {
           const el = e.currentTarget
-          if (deck.loopStart !== null && deck.loopEnd !== null && el.currentTime >= deck.loopEnd) el.currentTime = deck.loopStart
-          onDeck({ ...deck, current: el.currentTime, duration: el.duration || 0 })
+          const { start, end } = loopRef.current
+          if (start !== null && end !== null && end > start && el.currentTime >= end) el.currentTime = start
+          onDeck({ current: el.currentTime, duration: el.duration || 0 })
         }}
       />
       <header>
-        <b className="deck-letter">{letter}</b>
+        <b className="deck-letter" aria-hidden="true">{letter}</b>
         <div>
           <h2>{deck.track?.title || 'Empty deck'}</h2>
           <p>{deck.track?.artist || 'Load a track from your library'}</p>
@@ -131,12 +155,12 @@ function DeckView({
         min="0"
         max={deck.duration || 1}
         step="0.1"
-        value={deck.current}
+        value={Math.min(deck.current, deck.duration || 1)}
         disabled={!deck.track}
         onChange={(e) => {
-          const el = document.querySelector<HTMLAudioElement>(`#deck-audio-${index}`)
-          if (el) el.currentTime = Number(e.target.value)
-          onDeck({ ...deck, current: Number(e.target.value) })
+          const next = Number(e.target.value)
+          if (elRef.current) elRef.current.currentTime = next
+          onDeck({ current: next })
         }}
       />
       <div className="deck-time">
@@ -145,35 +169,45 @@ function DeckView({
       </div>
       <div className="transport-row">
         <button
+          type="button"
           className="transport"
           data-testid={`deck-${letter.toLowerCase()}-cue`}
           disabled={!deck.track}
+          aria-label={`Deck ${letter} cue to start`}
           onClick={() => {
-            const el = document.querySelector<HTMLAudioElement>(`#deck-audio-${index}`)
-            if (el) el.currentTime = 0
+            if (elRef.current) elRef.current.currentTime = 0
+            onDeck({ current: 0 })
           }}
         >
           CUE
         </button>
         <button
+          type="button"
           className="transport play"
           data-testid={`deck-${letter.toLowerCase()}-play`}
           disabled={!deck.track}
           onClick={toggle}
-          aria-label={deck.playing ? 'Pause' : 'Play'}
+          aria-label={deck.playing ? `Pause deck ${letter}` : `Play deck ${letter}`}
         >
           {deck.playing ? <Pause /> : <Play />}
         </button>
         <button
-          className="transport"
+          type="button"
+          className={`transport ${looping ? 'active' : ''}`}
           data-testid={`deck-${letter.toLowerCase()}-loop`}
           disabled={!deck.track}
-          onClick={() => onDeck({ ...deck, loopStart: deck.current, loopEnd: Math.min(deck.duration, deck.current + 8) })}
+          aria-pressed={looping}
+          aria-label={looping ? `Deck ${letter} release 8-beat loop` : `Deck ${letter} set 8-second loop`}
+          onClick={() =>
+            looping
+              ? onDeck({ loopStart: null, loopEnd: null })
+              : onDeck({ loopStart: deck.current, loopEnd: Math.min(deck.duration || deck.current + 8, deck.current + 8) })
+          }
         >
           LOOP
         </button>
         <label>
-          SPEED
+          SPEED {deck.rate !== 1 ? `${deck.rate > 1 ? '+' : ''}${Math.round((deck.rate - 1) * 100)}%` : ''}
           <input
             aria-label={`Deck ${letter} speed`}
             type="range"
@@ -181,17 +215,17 @@ function DeckView({
             max="1.25"
             step="0.01"
             value={deck.rate}
+            disabled={!deck.track}
             onChange={(e) => {
               const rate = Number(e.target.value)
-              const el = document.querySelector<HTMLAudioElement>(`#deck-audio-${index}`)
-              if (el) el.playbackRate = rate
-              onDeck({ ...deck, rate })
+              if (elRef.current) elRef.current.playbackRate = rate
+              onDeck({ rate })
             }}
           />
         </label>
       </div>
       {!deck.track && tracks.length > 0 && (
-        <button className="deck-load" data-testid={`deck-${letter.toLowerCase()}-quickload`} onClick={() => onLoad(tracks[0])}>
+        <button type="button" className="deck-load" data-testid={`deck-${letter.toLowerCase()}-quickload`} onClick={() => onLoad(tracks[0])}>
           Load first library track
         </button>
       )}
@@ -208,13 +242,14 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
   const [query, setQuery] = useState('')
   const [crossfade, setCrossfade] = useState(50)
   const [uploading, setUploading] = useState(false)
+  const [libraryStatus, setLibraryStatus] = useState('')
   const [assistant, setAssistant] = useState('Ask for a transition, set-building, or harmonic-mixing recommendation.')
   const [asking, setAsking] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
   const audioRefs = useRef<(HTMLAudioElement | null)[]>([])
 
   const filtered = useMemo(
-    () => tracks.filter((t) => `${t.title} ${t.artist}`.toLowerCase().includes(query.toLowerCase())),
+    () => tracks.filter((t) => `${t.title} ${t.artist}`.toLowerCase().includes(query.trim().toLowerCase())),
     [tracks, query]
   )
 
@@ -226,29 +261,32 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
     })
   }, [crossfade, decks])
 
-  function update(i: number, next: Deck) {
-    setDecks((d) => d.map((x, j) => (i === j ? next : x)))
+  function update(i: number, patch: Partial<Deck>) {
+    setDecks((d) => d.map((x, j) => (i === j ? { ...x, ...patch } : x)))
   }
   function load(i: number, t: Track) {
     const el = audioRefs.current[i]
     if (el) {
       el.pause()
       el.currentTime = 0
+      el.playbackRate = 1
     }
-    update(i, { ...blank(), track: t })
+    setDecks((d) => d.map((x, j) => (i === j ? { ...blank(), track: t } : x)))
   }
 
   async function upload(file: File) {
     setUploading(true)
+    setLibraryStatus('')
     try {
       const duration = await new Promise<number>((resolve) => {
         const a = document.createElement('audio')
         const url = URL.createObjectURL(file)
-        a.onloadedmetadata = () => {
-          resolve(Number.isFinite(a.duration) ? a.duration : 0)
+        const done = (n: number) => {
           URL.revokeObjectURL(url)
+          resolve(n)
         }
-        a.onerror = () => resolve(0)
+        a.onloadedmetadata = () => done(Number.isFinite(a.duration) ? a.duration : 0)
+        a.onerror = () => done(0)
         a.src = url
       })
       const base = file.name.replace(/\.[^.]+$/, '')
@@ -259,10 +297,14 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
       form.set('artist', parts.length > 1 ? parts[0] : 'Unknown Artist')
       form.set('duration', String(duration))
       const res = await fetch('/api/tracks', { method: 'POST', body: form })
-      if (!res.ok) throw new Error((await res.json()).error)
+      if (!res.ok) {
+        const body = await res.json().catch(() => null)
+        throw new Error(body?.error || 'Upload failed')
+      }
       await mutate()
+      setLibraryStatus(`Added “${parts.length > 1 ? parts.slice(1).join(' - ') : base}” to your library.`)
     } catch (e) {
-      setAssistant(e instanceof Error ? e.message : 'Upload failed')
+      setLibraryStatus(e instanceof Error ? e.message : 'Upload failed')
     } finally {
       setUploading(false)
     }
@@ -270,29 +312,48 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
 
   async function remove(id: string) {
     if (!confirm('Delete this track from your private library?')) return
-    const res = await fetch(`/api/tracks?id=${id}`, { method: 'DELETE' })
-    if (res.ok) {
-      setDecks((d) => d.map((x) => (x.track?.id === id ? blank() : x)))
+    setLibraryStatus('')
+    try {
+      const res = await fetch(`/api/tracks?id=${id}`, { method: 'DELETE' })
+      if (!res.ok) {
+        const body = await res.json().catch(() => null)
+        throw new Error(body?.error || 'Delete failed')
+      }
+      setDecks((d) =>
+        d.map((x) => {
+          if (x.track?.id !== id) return x
+          const i = d.indexOf(x)
+          const el = audioRefs.current[i]
+          if (el) el.pause()
+          return blank()
+        })
+      )
       await mutate()
+    } catch (e) {
+      setLibraryStatus(e instanceof Error ? e.message : 'Delete failed')
     }
   }
 
   async function ask(prompt: string) {
+    const clean = prompt.trim()
+    if (!clean || asking) return
     setAsking(true)
     try {
       const res = await fetch('/api/assistant', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, tracks }),
+        body: JSON.stringify({ prompt: clean, tracks }),
       })
-      const json = await res.json()
-      setAssistant(json.text || json.error)
+      const json = await res.json().catch(() => null)
+      setAssistant(json?.text || json?.error || 'The assistant could not answer that. Try again.')
+    } catch {
+      setAssistant('The assistant is unreachable right now. Check your connection and try again.')
     } finally {
       setAsking(false)
     }
   }
 
-  const NAV: { id: View; label: string; icon: any }[] = [
+  const NAV: { id: View; label: string; icon: ComponentType }[] = [
     { id: 'perform', label: 'Perform', icon: Radio },
     { id: 'sources', label: 'Sources', icon: HardDrive },
     { id: 'discover', label: 'Discover', icon: Compass },
@@ -315,11 +376,13 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
             </small>
           </div>
         </div>
-        <nav className="view-tabs" data-testid="view-tabs">
+        <nav className="view-tabs" data-testid="view-tabs" aria-label="Workspace views">
           {NAV.map((n) => (
             <button
+              type="button"
               key={n.id}
               className={view === n.id ? 'active' : ''}
+              aria-current={view === n.id ? 'page' : undefined}
               onClick={() => setView(n.id)}
               data-testid={`view-tab-${n.id}`}
             >
@@ -333,6 +396,7 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
             {tracks.length} TRACKS
           </span>
           <button
+            type="button"
             className="icon-button"
             onClick={() => authClient.signOut().then(() => (location.href = '/sign-in'))}
             aria-label="Sign out"
@@ -343,9 +407,16 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
         </div>
       </header>
 
-      <nav className="mobile-nav">
+      <nav className="mobile-nav" aria-label="Workspace views">
         {NAV.map((n) => (
-          <button key={n.id} className={view === n.id ? 'active' : ''} onClick={() => setView(n.id)} data-testid={`mobile-tab-${n.id}`}>
+          <button
+            type="button"
+            key={n.id}
+            className={view === n.id ? 'active' : ''}
+            aria-current={view === n.id ? 'page' : undefined}
+            onClick={() => setView(n.id)}
+            data-testid={`mobile-tab-${n.id}`}
+          >
             <n.icon />
             {n.label}
           </button>
@@ -356,17 +427,23 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
       <div className={view === 'perform' ? 'view-wrap' : 'view-hidden'} data-testid="view-perform">
         <section className={`performance-grid mode-${deckCount}`}>
           <div className="perform-toolbar">
-            <div className="deck-toggle">
-              <button className={deckCount === 2 ? 'active' : ''} onClick={() => setDeckCount(2)} data-testid="deck-mode-2">
+            <div className="deck-toggle" role="group" aria-label="Deck layout">
+              <button type="button" className={deckCount === 2 ? 'active' : ''} aria-pressed={deckCount === 2} onClick={() => setDeckCount(2)} data-testid="deck-mode-2">
                 2 DECK
               </button>
-              <button className={deckCount === 4 ? 'active' : ''} onClick={() => setDeckCount(4)} data-testid="deck-mode-4">
+              <button
+                type="button"
+                className={deckCount === 4 ? 'active' : ''}
+                aria-pressed={deckCount === 4}
+                onClick={() => setDeckCount(4)}
+                data-testid="deck-mode-4"
+              >
                 4 DECK
               </button>
             </div>
-            <div className="mobile-deck-tabs">
+            <div className="mobile-deck-tabs" role="group" aria-label="Visible deck">
               {Array.from({ length: deckCount }, (_, i) => (
-                <button key={i} className={mobileDeck === i ? 'active' : ''} onClick={() => setMobileDeck(i)}>
+                <button type="button" key={i} className={mobileDeck === i ? 'active' : ''} aria-pressed={mobileDeck === i} onClick={() => setMobileDeck(i)}>
                   DECK {String.fromCharCode(65 + i)}
                 </button>
               ))}
@@ -375,41 +452,70 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
           <div className="decks-grid">
             {decks.slice(0, deckCount).map((d, i) => (
               <div className={mobileDeck === i ? 'mobile-active' : ''} key={i}>
-                <DeckView index={i} deck={d} audio={(el) => (audioRefs.current[i] = el)} onDeck={(n) => update(i, n)} onLoad={(t) => load(i, t)} tracks={tracks} />
+                <DeckView
+                  index={i}
+                  deck={d}
+                  audio={(el) => (audioRefs.current[i] = el)}
+                  onDeck={(patch) => update(i, patch)}
+                  onLoad={(t) => load(i, t)}
+                  tracks={tracks}
+                />
               </div>
             ))}
           </div>
-          <section className="panel mixer-panel">
+          <section className="panel mixer-panel" aria-label="Mixer">
             <header>
               <span>MIXER</span>
-              <SlidersHorizontal />
+              <SlidersHorizontal aria-hidden="true" />
             </header>
             {decks.slice(0, deckCount).map((d, i) => (
               <label key={i}>
                 DECK {String.fromCharCode(65 + i)}
-                <input type="range" min="0" max="1" step="0.01" value={d.volume} onChange={(e) => update(i, { ...d, volume: Number(e.target.value) })} />
+                <input
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.01"
+                  value={d.volume}
+                  aria-label={`Deck ${String.fromCharCode(65 + i)} volume`}
+                  onChange={(e) => update(i, { volume: Number(e.target.value) })}
+                />
               </label>
             ))}
             <label>
               CROSSFADER
-              <input type="range" min="0" max="100" value={crossfade} onChange={(e) => setCrossfade(Number(e.target.value))} data-testid="crossfader" />
+              <input
+                type="range"
+                min="0"
+                max="100"
+                value={crossfade}
+                aria-label="Crossfader"
+                onChange={(e) => setCrossfade(Number(e.target.value))}
+                data-testid="crossfader"
+              />
             </label>
           </section>
         </section>
 
         <section className="workspace-lower">
-          <section className="library-panel">
+          <section className="library-panel" aria-label="Private library">
             <header className="library-header">
               <div>
                 <p className="eyebrow">
-                  <Library />
+                  <Library aria-hidden="true" />
                   PRIVATE LIBRARY
                 </p>
                 <h2>Your tracks</h2>
               </div>
               <label className="search">
-                <Search />
-                <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search your library" data-testid="library-search" />
+                <Search aria-hidden="true" />
+                <input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Search your library"
+                  aria-label="Search your library"
+                  data-testid="library-search"
+                />
               </label>
               <input
                 ref={fileRef}
@@ -422,11 +528,23 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
                   e.target.value = ''
                 }}
               />
-              <button className="primary-action" disabled={uploading} onClick={() => fileRef.current?.click()} data-testid="upload-audio-button">
-                {uploading ? <LoaderCircle className="spin" /> : <CloudUpload />}
+              <button
+                type="button"
+                className="primary-action"
+                disabled={uploading}
+                aria-busy={uploading}
+                onClick={() => fileRef.current?.click()}
+                data-testid="upload-audio-button"
+              >
+                {uploading ? <LoaderCircle className="spin" aria-hidden /> : <CloudUpload aria-hidden />}
                 {uploading ? 'Uploading' : 'Upload audio'}
               </button>
             </header>
+            {libraryStatus && (
+              <p className={`status-line library-status ${libraryStatus.includes('failed') || libraryStatus.includes('error') || libraryStatus.includes('Delete') || libraryStatus.includes('unavailable') ? 'error' : ''}`} role="status" data-testid="library-status">
+                {libraryStatus}
+              </p>
+            )}
             {isLoading ? (
               <div className="empty-state">
                 <LoaderCircle className="spin" />
@@ -436,16 +554,21 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
               <div className="empty-state">
                 <b>Library unavailable</b>
                 <p>{error.message}</p>
+                <button type="button" className="ghost-action" onClick={() => mutate()}>
+                  Retry
+                </button>
               </div>
             ) : filtered.length === 0 ? (
               <div className="empty-state" data-testid="library-empty">
                 <Disc3 />
                 <b>{tracks.length ? 'No matching tracks' : 'Your library is empty'}</b>
                 <p>{tracks.length ? 'Try another search.' : 'Upload audio, add local sources, or import from the open catalog.'}</p>
-                <button className="primary-action" onClick={() => fileRef.current?.click()}>
-                  <Plus />
-                  Add your first track
-                </button>
+                {tracks.length === 0 && (
+                  <button type="button" className="primary-action" onClick={() => fileRef.current?.click()}>
+                    <Plus />
+                    Add your first track
+                  </button>
+                )}
               </div>
             ) : (
               <div className="real-track-list" data-testid="track-list">
@@ -464,6 +587,7 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
                     <div className="load-actions">
                       {Array.from({ length: deckCount }, (_, d) => (
                         <button
+                          type="button"
                           key={d}
                           onClick={() => {
                             load(d, t)
@@ -476,7 +600,13 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
                           {String.fromCharCode(65 + d)}
                         </button>
                       ))}
-                      <button className="delete" onClick={() => remove(t.id)} aria-label={`Delete ${t.title}`} data-testid={`delete-track-${t.id}`}>
+                      <button
+                        type="button"
+                        className="delete"
+                        onClick={() => remove(t.id)}
+                        aria-label={`Delete ${t.title}`}
+                        data-testid={`delete-track-${t.id}`}
+                      >
                         <Trash2 />
                       </button>
                     </div>
@@ -485,31 +615,33 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
               </div>
             )}
           </section>
-          <aside className="ai-panel">
+          <aside className="ai-panel" aria-label="Performance assistant">
             <header>
               <span>
-                <Bot />
+                <Bot aria-hidden="true" />
               </span>
               <div>
                 <p>GEMINI PERFORMANCE ASSISTANT</p>
                 <b>Grounded in your library</b>
               </div>
             </header>
-            <div className="assistant-response" data-testid="assistant-response">
-              <Sparkles />
+            <div className="assistant-response" role="status" data-testid="assistant-response">
+              <Sparkles aria-hidden="true" />
               <p>{assistant}</p>
             </div>
             <form
               onSubmit={(e) => {
                 e.preventDefault()
                 const f = new FormData(e.currentTarget)
-                ask(String(f.get('prompt')))
+                const prompt = String(f.get('prompt') || '')
+                if (!prompt.trim()) return
+                ask(prompt)
                 e.currentTarget.reset()
               }}
             >
-              <textarea name="prompt" placeholder="What should I play next?" required data-testid="assistant-input" />
-              <button className="primary-action" disabled={asking} data-testid="assistant-submit">
-                {asking ? <LoaderCircle className="spin" /> : <Bot />}Ask Gemini
+              <textarea name="prompt" placeholder="What should I play next?" required aria-label="Ask the assistant" data-testid="assistant-input" />
+              <button className="primary-action" disabled={asking} aria-busy={asking} data-testid="assistant-submit">
+                {asking ? <LoaderCircle className="spin" aria-hidden /> : <Bot aria-hidden />}Ask Gemini
               </button>
             </form>
             <small>Recommendations use only your private library metadata. Audio is not sent to Gemini.</small>
