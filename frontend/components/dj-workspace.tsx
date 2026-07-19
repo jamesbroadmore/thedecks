@@ -532,15 +532,16 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
                 type="button"
                 className="primary-action"
                 disabled={uploading}
+                aria-busy={uploading}
                 onClick={() => fileRef.current?.click()}
                 data-testid="upload-audio-button"
               >
-                {uploading ? <LoaderCircle className="spin" /> : <CloudUpload />}
+                {uploading ? <LoaderCircle className="spin" aria-hidden /> : <CloudUpload aria-hidden />}
                 {uploading ? 'Uploading' : 'Upload audio'}
               </button>
             </header>
             {libraryStatus && (
-              <p className="status-line library-status" role="status" data-testid="library-status">
+              <p className={`status-line library-status ${libraryStatus.includes('failed') || libraryStatus.includes('error') || libraryStatus.includes('Delete') || libraryStatus.includes('unavailable') ? 'error' : ''}`} role="status" data-testid="library-status">
                 {libraryStatus}
               </p>
             )}
@@ -639,8 +640,8 @@ export function DJWorkspace({ user }: { user: { name: string; email: string } })
               }}
             >
               <textarea name="prompt" placeholder="What should I play next?" required aria-label="Ask the assistant" data-testid="assistant-input" />
-              <button className="primary-action" disabled={asking} data-testid="assistant-submit">
-                {asking ? <LoaderCircle className="spin" /> : <Bot />}Ask Gemini
+              <button className="primary-action" disabled={asking} aria-busy={asking} data-testid="assistant-submit">
+                {asking ? <LoaderCircle className="spin" aria-hidden /> : <Bot aria-hidden />}Ask Gemini
               </button>
             </form>
             <small>Recommendations use only your private library metadata. Audio is not sent to Gemini.</small>
