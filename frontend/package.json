@@ -21,7 +21,7 @@
     "lucide-react": "^1.16.0",
     "music-metadata": "^11.14.0",
     "music-metadata-browser": "^2.5.11",
-    "next": "16.2.6",
+    "next": "16.2.12",
     "node-fetch": "^3.3.2",
     "pg": "^8.22.0",
     "react": "^19",
